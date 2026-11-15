@@ -1,0 +1,375 @@
+openapi: 3.0.3
+info:
+  title: API сервиса выполнения заданий (Qeu)
+  version: 0.1.0
+  description: |
+    Проектируемый контракт для практики P2. Реализация API планируется
+    в последующих практиках. Запросы создают Job, а результат получают
+    отдельным GET-запросом. Ошибки HTTP имеют единый формат ApiError.
+servers:
+  - url: http://localhost:8000
+    description: Локальный запуск (планируется)
+tags:
+  - name: Jobs
+    description: Создание задач и получение их состояния
+paths:
+  /jobs:
+    post:
+      tags: [Jobs]
+      summary: Создать вычислительную, текстовую или HTTP-задачу
+      operationId: createJob
+      description: |
+        Сначала проверяются тип операции и её параметры. При ошибке
+        валидации Job не создаётся. Новый Job сохраняется в состоянии
+        `created` и выполняется фоновым исполнителем.
+
+        Заголовок `Idempotency-Key` необязателен, но рекомендуется при
+        повторных попытках. Пока запись Job хранится, одинаковый ключ
+        и идентичные данные не создают новый Job: возвращается 200
+        с текущим состоянием ранее созданного Job. Тот же ключ с другими
+        данными возвращает 409; существующий Job не изменяется.
+        Сравнивается нормализованный запрос (operation + params).
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Уникальный для логического запроса ключ (1–128 символов).
+            Повтор с тем же ключом допустим только при совпадении тела.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          example: calc-request-001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+            examples:
+              addition:
+                summary: Сложить 15 и 25
+                value:
+                  operation: calculator.add
+                  params:
+                    a: 15
+                    b: 25
+              uppercase:
+                summary: Преобразовать hello в HELLO
+                value:
+                  operation: text.uppercase
+                  params:
+                    text: hello
+              external:
+                summary: Получить ресурс из настроенного HTTP-сервиса
+                value:
+                  operation: http.get
+                  params:
+                    resource: example
+      responses:
+        '202':
+          description: Новый Job создан и принят в обработку
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              example:
+                id: 4dbe8e36-47f2-4306-b8b3-0c8a10a7d8d1
+                operation: calculator.add
+                status: created
+                created_at: '2026-11-15T12:00:00Z'
+                updated_at: '2026-11-15T12:00:00Z'
+        '200':
+          description: Идемпотентный повтор; уже существующий Job, без повторного запуска
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Неизвестная операция, недопустимые параметры, JSON или ключ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              examples:
+                unknown_operation:
+                  summary: Неизвестная операция
+                  value:
+                    error:
+                      code: UNKNOWN_OPERATION
+                      message: Операция не поддерживается
+                      field: operation
+                invalid_params:
+                  summary: Неверный тип параметра
+                  value:
+                    error:
+                      code: INVALID_PARAMS
+                      message: Параметр должен быть числом
+                      field: params.a
+                division_by_zero:
+                  summary: Деление на ноль отклоняется до создания Job
+                  value:
+                    error:
+                      code: INVALID_PARAMS
+                      message: Делитель не может быть равен нулю
+                      field: params.b
+        '409':
+          description: Ключ идемпотентности уже связан с другим запросом
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error:
+                  code: IDEMPOTENCY_KEY_REUSED
+                  message: Ключ уже использован с другими параметрами
+                  field: Idempotency-Key
+        '413':
+          description: Тело HTTP-запроса превышает лимит размера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error:
+                  code: REQUEST_TOO_LARGE
+                  message: Превышен максимально допустимый размер запроса
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Получить состояние и результат Job по идентификатору
+      operationId: getJob
+      description: |
+        Запрос не изменяет состояние Job. В `created` и `running`
+        результат ещё отсутствует. В `done` присутствует `result`,
+        в `failed` — `error`. Ошибка выполнения Tool не меняет
+        HTTP-статус GET: для существующей задачи возвращается 200.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID ранее созданной задачи
+          schema:
+            type: string
+            format: uuid
+          example: 4dbe8e36-47f2-4306-b8b3-0c8a10a7d8d1
+      responses:
+        '200':
+          description: Job найден (включая состояние failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              examples:
+                finished_calculation:
+                  summary: Выполненное сложение
+                  value:
+                    id: 4dbe8e36-47f2-4306-b8b3-0c8a10a7d8d1
+                    operation: calculator.add
+                    status: done
+                    created_at: '2026-11-15T12:00:00Z'
+                    updated_at: '2026-11-15T12:00:01Z'
+                    result:
+                      value: 40
+                finished_text:
+                  summary: Текст в верхнем регистре
+                  value:
+                    id: a4a608a2-5bca-47aa-b006-745913a5cda8
+                    operation: text.uppercase
+                    status: done
+                    created_at: '2026-11-15T12:00:00Z'
+                    updated_at: '2026-11-15T12:00:01Z'
+                    result:
+                      value: HELLO
+                failed_http:
+                  summary: Неудачный вызов внешнего сервиса
+                  value:
+                    id: 03b2632a-41d7-42e1-a0d1-03b5d6ad7c17
+                    operation: http.get
+                    status: failed
+                    created_at: '2026-11-15T12:00:00Z'
+                    updated_at: '2026-11-15T12:00:10Z'
+                    error:
+                      code: PROVIDER_TIMEOUT
+                      message: Внешний сервис не ответил в отведённое время
+        '400':
+          description: Некорректный формат идентификатора Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error:
+                  code: INVALID_ID
+                  message: Ожидается UUID
+                  field: id
+        '404':
+          description: Job с указанным идентификатором не найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error:
+                  code: JOB_NOT_FOUND
+                  message: Задача не найдена
+                  field: id
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  schemas:
+    CreateJobRequest:
+      description: |
+        Тип запроса зависит от operation. Ошибки несоответствия
+        любой из схем преобразуются API в 400 INVALID_PARAMS;
+        неизвестный тип операции — в 400 UNKNOWN_OPERATION.
+      oneOf:
+        - $ref: '#/components/schemas/CalculatorRequest'
+        - $ref: '#/components/schemas/TextRequest'
+        - $ref: '#/components/schemas/HttpRequest'
+    CalculatorRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [calculator.add, calculator.subtract, calculator.multiply, calculator.divide]
+        params:
+          type: object
+          additionalProperties: false
+          required: [a, b]
+          properties:
+            a:
+              type: number
+            b:
+              type: number
+          description: Для calculator.divide значение b не должно быть равно нулю.
+    TextRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [text.uppercase, text.lowercase]
+        params:
+          type: object
+          additionalProperties: false
+          required: [text]
+          properties:
+            text:
+              type: string
+              minLength: 1
+              maxLength: 10000
+    HttpRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, params]
+      properties:
+        operation:
+          type: string
+          enum: [http.get]
+        params:
+          type: object
+          additionalProperties: false
+          required: [resource]
+          properties:
+            resource:
+              type: string
+              minLength: 1
+              maxLength: 255
+              pattern: '^[a-zA-Z0-9/_-]+$'
+              description: |
+                Относительный идентификатор ресурса. Внешний base URL
+                задаётся конфигурацией, а не пользовательским запросом.
+    Job:
+      type: object
+      description: |
+        Задача и её текущее состояние. В created/running нет ни result,
+        ни error. В done присутствует result, в failed — error.
+        Завершённые состояния done/failed терминальны.
+      additionalProperties: false
+      required: [id, operation, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        operation:
+          type: string
+          description: Тип зарегистрированной операции
+          example: calculator.add
+        status:
+          type: string
+          enum: [created, running, done, failed]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        result:
+          $ref: '#/components/schemas/ToolOutput'
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+    ToolOutput:
+      type: object
+      description: Результат успешно завершённого Tool; поля зависят от операции.
+      required: [value]
+      properties:
+        value:
+          description: Число, строка или структурированный JSON-результат
+          oneOf:
+            - type: number
+            - type: string
+            - type: object
+            - type: array
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      description: Код, сообщение и при необходимости поле с ошибкой
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: INVALID_PARAMS
+        message:
+          type: string
+          example: Параметр должен быть числом
+        field:
+          type: string
+          description: Путь к ошибочному полю, если ошибка связана с ним
+          example: params.a
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+  responses:
+    UnsupportedMediaType:
+      description: Требуется Content-Type application/json
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            error:
+              code: UNSUPPORTED_MEDIA_TYPE
+              message: Требуется Content-Type application/json
+    InternalError:
+      description: Внутренняя ошибка API (детали не раскрываются клиенту)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Внутренняя ошибка сервиса
